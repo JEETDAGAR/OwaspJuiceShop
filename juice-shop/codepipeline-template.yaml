@@ -1,0 +1,306 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CodePipeline for OWASP Juice Shop Application with Security Scanning'
+
+Parameters:
+  GitHubOwner:
+    Type: String
+    Description: GitHub repository owner
+    Default: juice-shop
+  
+  GitHubRepo:
+    Type: String
+    Description: GitHub repository name
+    Default: juice-shop
+  
+  GitHubBranch:
+    Type: String
+    Description: GitHub branch name
+    Default: master
+  
+  ExistingCodeStarConnectionArn:
+    Type: String
+    Description: ARN of existing CodeStar connection to GitHub
+  
+  EksClusterName:
+    Type: String
+    Description: Name of the EKS cluster
+  
+  EcrRepositoryName:
+    Type: String
+    Description: Name of the ECR repository
+    Default: juice-shop
+
+Resources:
+  # ECR Repository creation
+  JuiceShopECRRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Ref EcrRepositoryName
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Keep only the last 10 images",
+                "selection": {
+                  "tagStatus": "any",
+                  "countType": "imageCountMoreThan",
+                  "countNumber": 10
+                },
+                "action": {
+                  "type": "expire"
+                }
+              }
+            ]
+          }
+
+  # CodeBuild Service Role
+  CodeBuildServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryFullAccess'
+        - 'arn:aws:iam::aws:policy/AmazonEKSClusterPolicy'
+      Policies:
+        - PolicyName: CodeBuildServiceRolePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'eks:*'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'ssm:GetParameters'
+                  - 'ssm:GetParameter'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 's3:GetObject'
+                  - 's3:GetObjectVersion'
+                  - 's3:PutObject'
+                  - 's3:ListBucket'
+                Resource: 
+                  - !Sub 'arn:aws:s3:::${ArtifactBucket}'
+                  - !Sub 'arn:aws:s3:::${ArtifactBucket}/*'
+              - Effect: Allow
+                Action:
+                  - 'iam:PassRole'
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    'iam:PassedToService': 'eks.amazonaws.com'
+              - Effect: Allow
+                Action:
+                  - 'sts:AssumeRole'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'iam:CreateServiceLinkedRole'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'inspector2:CreateFindingAggregator'
+                  - 'inspector2:ListFindingAggregators'
+                  - 'inspector2:GetFindingsReportStatus'
+                  - 'inspector2:GetFindings'
+                  - 'ecr:StartImageScan'
+                  - 'ecr:BatchGetImage'
+                  - 'ecr:DescribeImages'
+                  - 'ecr:DescribeImageScanFindings'
+                  - 'ecr:GetDownloadUrlForLayer'
+                  - 'ecr:BatchCheckLayerAvailability'
+                  - 'ecr:GetAuthorizationToken'
+                Resource: '*'
+
+  # CodePipeline Service Role
+  CodePipelineServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codepipeline.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/AWSCodeBuildAdminAccess'
+      Policies:
+        - PolicyName: CodePipelineServiceRolePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:GetObject'
+                  - 's3:GetObjectVersion'
+                  - 's3:GetBucketVersioning'
+                  - 's3:PutObject'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'codebuild:BatchGetBuilds'
+                  - 'codebuild:StartBuild'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'codestar-connections:UseConnection'
+                Resource: !Ref ExistingCodeStarConnectionArn
+
+  # S3 Bucket for CodePipeline artifacts
+  ArtifactBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      VersioningConfiguration:
+        Status: Enabled
+
+  # Security Scan CodeBuild Project
+  SecurityScanProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub ${AWS::StackName}-security-scan
+      ServiceRole: !GetAtt CodeBuildServiceRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:4.0
+        PrivilegedMode: true
+        EnvironmentVariables:
+          - Name: AWS_DEFAULT_REGION
+            Value: !Ref AWS::Region
+          - Name: AWS_ACCOUNT_ID
+            Value: !Ref AWS::AccountId
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: buildspec-security.yml
+
+  # Main Build CodeBuild Project
+  JuiceShopBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub ${AWS::StackName}-build
+      ServiceRole: !GetAtt CodeBuildServiceRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:4.0
+        PrivilegedMode: true
+        EnvironmentVariables:
+          - Name: AWS_DEFAULT_REGION
+            Value: !Ref AWS::Region
+          - Name: AWS_ACCOUNT_ID
+            Value: !Ref AWS::AccountId
+          - Name: EKS_CLUSTER_NAME
+            Value: !Ref EksClusterName
+          - Name: NODE_ENV
+            Value: "production"
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: buildspec.yml
+
+  # CodePipeline
+  JuiceShopPipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: !Sub ${AWS::StackName}-juice-shop-pipeline
+      RoleArn: !GetAtt CodePipelineServiceRole.Arn
+      ArtifactStore:
+        Type: S3
+        Location: !Ref ArtifactBucket
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: Source
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: CodeStarSourceConnection
+                Version: '1'
+              Configuration:
+                ConnectionArn: !Ref ExistingCodeStarConnectionArn
+                FullRepositoryId: !Sub ${GitHubOwner}/${GitHubRepo}
+                BranchName: !Ref GitHubBranch
+                DetectChanges: true
+              OutputArtifacts:
+                - Name: SourceCode
+        - Name: SecurityScan
+          Actions:
+            - Name: SAST-Scan
+              ActionTypeId:
+                Category: Test
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              Configuration:
+                ProjectName: !Ref SecurityScanProject
+              InputArtifacts:
+                - Name: SourceCode            
+        - Name: Build
+          Actions:
+            - Name: BuildAndDeploy
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              Configuration:
+                ProjectName: !Ref JuiceShopBuildProject
+              InputArtifacts:
+                - Name: SourceCode
+
+  # IAM Role for CloudWatch Events
+  EventsServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: EventsServiceRolePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: 'codepipeline:StartPipelineExecution'
+                Resource: !Sub "arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:${JuiceShopPipeline}"
+
+Outputs:
+  PipelineURL:
+    Description: URL to the CodePipeline console
+    Value: !Sub https://console.aws.amazon.com/codepipeline/home?region=${AWS::Region}#/view/${JuiceShopPipeline}
+  
+  EcrRepositoryURL:
+    Description: URL of the ECR Repository
+    Value: !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${EcrRepositoryName}
+  
+  SecurityScanProjectURL:
+    Description: URL to the Security Scan CodeBuild Project
+    Value: !Sub https://console.aws.amazon.com/codesuite/codebuild/projects/${SecurityScanProject}/history?region=${AWS::Region}
+  
+  JuiceShopBuildProjectURL:
+    Description: URL to the Juice Shop Build CodeBuild Project
+    Value: !Sub https://console.aws.amazon.com/codesuite/codebuild/projects/${JuiceShopBuildProject}/history?region=${AWS::Region}

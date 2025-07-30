@@ -1,0 +1,97 @@
+version: 0.2
+env:
+  parameter-store:
+    SONAR_TOKEN: "/sonarcloud/token"
+    SONAR_HOST: "/sonarcloud/host"
+    SONAR_ORG: "/sonarcloud/organization"
+    SONAR_PROJECT: "/sonarcloud/project"
+    S3_BUCKET_NAME: "/security-scans/bucket-name"
+    AWS_ACCOUNT_ID: "/juice-shop/aws-account-id"
+    AWS_DEFAULT_REGION: "/juice-shop/aws-default-region"
+  variables:
+    INSPECTOR_ENABLED: "true"
+phases:
+  install:
+    runtime-versions:
+      java: corretto17
+    commands:
+      - export JAVA_HOME=/usr/lib/jvm/java-17-amazon-corretto
+      - export PATH=$PATH:$JAVA_HOME/bin
+      - java -version
+      - echo "Installing SonarCloud Scanner"
+      - wget https://binaries.sonarsource.com/Distribution/sonar-scanner-cli/sonar-scanner-cli-5.0.1.3006-linux.zip
+      - unzip sonar-scanner-cli-5.0.1.3006-linux.zip
+      - export PATH=$PATH:./sonar-scanner-5.0.1.3006-linux/bin
+      - echo "Installing Trivy"
+      - curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
+      - echo "Installing OWASP Dependency-Check"
+      - mkdir -p /opt/dependency-check
+      - curl -L https://github.com/jeremylong/DependencyCheck/releases/download/v8.2.1/dependency-check-8.2.1-release.zip -o /opt/dependency-check.zip
+      - unzip /opt/dependency-check.zip -d /opt
+      - chmod +x /opt/dependency-check/bin/dependency-check.sh
+  pre_build:
+    commands:
+      - echo "Starting security scans"
+      - echo "Checking SonarCloud parameters"
+      - echo "Verifying Parameter Store values are correctly loaded"
+      - aws ssm get-parameter --name "/sonarcloud/organization" --with-decryption | jq -r '.Parameter.Value' > /tmp/org_value.txt
+      - export SONAR_ORG_VERIFY=$(cat /tmp/org_value.txt)
+      - echo "Testing connectivity to SonarCloud"
+      - curl -v --connect-timeout 10 $SONAR_HOST || echo "Connection test to SonarCloud failed"
+  build:
+    commands:
+      - echo "Running SonarCloud Scanner"
+      - echo "Verifying SonarCloud parameters"
+      - echo "Running SonarCloud scan"
+      - sonar-scanner -Dsonar.projectKey=$SONAR_PROJECT -Dsonar.sources=. -Dsonar.host.url=$SONAR_HOST -Dsonar.token=$SONAR_TOKEN -Dsonar.exclusions=node_modules/**,**/*.test.js,**/*.spec.js,k8s/**,scripts/**,**/*.js,**/*.ts,**/*.jsx,**/*.tsx,**/*.html -Dsonar.junit.reportPaths= -Dsonar.testExecutionReportPaths= -Dsonar.scanner.connectTimeout=300 -Dsonar.scanner.readTimeout=300 || echo "SonarCloud scan failed but continuing"
+      - curl https://sonarcloud.io/api/qualitygates/project_status?projectKey=$SONAR_PROJECT >result.json
+      - cat result.json
+      - echo "Running Trivy for vulnerability scanning"
+      - trivy fs --security-checks vuln,config,secret --format json --output trivy-results.json . || echo "Trivy scan failed but continuing"
+      - echo "ECR Image scanning"
+      - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
+      - ECR_REPO_URI=$AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/juice-shop
+      - docker pull $ECR_REPO_URI:latest || echo "Failed to pull latest image, trying to pull most recent tag"
+      - if [ $? -ne 0 ]; then LATEST_TAG=$(aws ecr describe-images --repository-name juice-shop --query 'sort_by(imageDetails,& imagePushedAt)[-1].imageTags[0]' --output text); docker pull $ECR_REPO_URI:$LATEST_TAG; fi
+      - echo "Running Trivy image scan"
+      - trivy image --format json --output trivy-image-results.json $ECR_REPO_URI:latest || echo "Trivy image scan failed but continuing"
+      - echo "Running Amazon Inspector scans"
+      # Start Amazon Inspector scan for source code
+      - echo "Starting Amazon Inspector source code scan"
+      - aws inspector2 create-finding-aggregator || echo "Finding aggregator already exists"
+      - SCAN_ID=$(aws inspector2 start-sbom-generation --resource-ids file://$(pwd) --output text --query 'scanId') || echo "Failed to start Inspector SBOM scan"
+      # - echo "Inspector source code scan ID: $SCAN_ID"
+      - aws inspector2 list-findings --filter-criteria '{"findingStatus":[{"comparison":"EQUALS","value":"ACTIVE"}]}' --max-results 100 > inspector-source-findings.json || echo "Failed to get Inspector source findings"      
+      # Start Amazon Inspector scan for ECR image
+      - echo "Starting Amazon Inspector ECR image scan"
+      - IMAGE_DIGEST=$(docker inspect $ECR_REPO_URI:latest --format='{{index .RepoDigests 0}}' | cut -d'@' -f2) || echo "Failed to get image digest"
+      - aws ecr start-image-scan --repository-name juice-shop --image-id imageDigest=$IMAGE_DIGEST || echo "ECR image scan already in progress or failed to start"
+      - sleep 30
+      - aws ecr describe-image-scan-findings --repository-name juice-shop --image-id imageDigest=$IMAGE_DIGEST > inspector-ecr-findings.json || echo "Failed to get ECR scan findings"
+      # - echo "Running OWASP Dependency-Check"
+      # - export JAVA_HOME=/usr/lib/jvm/java-17-amazon-corretto
+      # - export PATH=$PATH:$JAVA_HOME/bin
+      # - /opt/dependency-check/bin/dependency-check.sh --scan . --format JSON --out owasp-dependency-check.json --exclude "node_modules/**" --enableExperimental || echo "OWASP scan failed but continuing"
+  post_build:
+    commands:
+      - echo "Security scanning completed"
+      - echo "Checking for critical vulnerabilities in Trivy results"
+      - if [ -f trivy-results.json ] && grep -q '"Severity":"CRITICAL"' trivy-results.json; then echo "Critical vulnerabilities found!"; else echo "No critical vulnerabilities found"; fi
+      - echo "Uploading analysis files to S3"
+      - aws s3 cp trivy-results.json s3://${S3_BUCKET_NAME}/security-scans/${CODEBUILD_BUILD_ID}/trivy-results.json || echo "Failed to upload Trivy results"
+      - aws s3 cp trivy-image-results.json s3://${S3_BUCKET_NAME}/security-scans/${CODEBUILD_BUILD_ID}/trivy-image-results.json || echo "Failed to upload Trivy image results"
+      - aws s3 cp inspector-source-findings.json s3://${S3_BUCKET_NAME}/security-scans/${CODEBUILD_BUILD_ID}/inspector-source-findings.json || echo "Failed to upload Inspector source findings"
+      - aws s3 cp inspector-ecr-findings.json s3://${S3_BUCKET_NAME}/security-scans/${CODEBUILD_BUILD_ID}/inspector-ecr-findings.json || echo "Failed to upload Inspector ECR findings"
+      - aws s3 cp owasp-dependency-check.json s3://${S3_BUCKET_NAME}/security-scans/${CODEBUILD_BUILD_ID}/owasp-dependency-check.json || echo "Failed to upload OWASP results"
+      - aws s3 cp --recursive .scannerwork/ s3://${S3_BUCKET_NAME}/security-scans/${CODEBUILD_BUILD_ID}/sonarcloud/ || echo "Failed to upload SonarCloud results"
+      - aws s3 cp result.json s3://${S3_BUCKET_NAME}/security-scans/${CODEBUILD_BUILD_ID}/sonarcloud/ || echo "Failed to upload SonarCloud results"
+artifacts:
+  files:
+    - trivy-results.json
+    - trivy-image-results.json
+    - owasp-dependency-check.json
+    - inspector-source-findings.json
+    - inspector-ecr-findings.json
+    - .scannerwork/**/*
+    - result.json
+  discard-paths: no

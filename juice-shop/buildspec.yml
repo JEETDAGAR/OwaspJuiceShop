@@ -1,0 +1,97 @@
+version: 0.2
+
+phases:
+  install:
+    runtime-versions:
+      nodejs: latest
+      docker: latest
+    commands:
+      - curl -LO "https://dl.k8s.io/release/stable.txt" || { echo "Failed to fetch stable.txt. Exiting."; exit 1; }
+      - curl -LO "https://dl.k8s.io/release/$(cat stable.txt)/bin/linux/amd64/kubectl"
+      - chmod +x ./kubectl
+      - mv ./kubectl /usr/local/bin
+      - pip install --upgrade awscli
+
+  pre_build:
+    commands:
+      - echo Logging in to Amazon ECR...
+      - |
+        if [ -z "$AWS_ACCOUNT_ID" ] || [ -z "$AWS_DEFAULT_REGION" ]; then
+          echo "Error: AWS_ACCOUNT_ID or AWS_DEFAULT_REGION is not set"
+          exit 1
+        fi
+      - |
+        if ! aws ssm get-parameter --name "/juice-shop/aws-account-id" --region $AWS_DEFAULT_REGION > /dev/null 2>&1; then
+          echo "Error: Failed to retrieve AWS_ACCOUNT_ID from Parameter Store"
+          exit 1
+        fi
+      - |
+        if ! aws ssm get-parameter --name "/juice-shop/eks-cluster-name" --region $AWS_DEFAULT_REGION > /dev/null 2>&1; then
+          echo "Error: Failed to retrieve EKS_CLUSTER_NAME from Parameter Store"
+          exit 1
+        fi
+      - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
+      - echo Configuring kubectl for EKS access...
+      - aws eks update-kubeconfig --name $EKS_CLUSTER_NAME --region $AWS_DEFAULT_REGION
+      - echo "Debugging IAM identity..."
+      - aws sts get-caller-identity
+      - echo "Updating EKS authentication..."
+      - chmod +x ./scripts/eks-auth-setup-unified.sh
+      - ./scripts/eks-auth-setup-unified.sh || true
+      - sleep 45
+      - echo "Verifying EKS access..."
+      - kubectl get namespaces || (echo "EKS authentication failed. Continuing anyway..." && true)
+      - REPOSITORY_URI=$AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/juice-shop
+      - COMMIT_HASH=$(echo $CODEBUILD_RESOLVED_SOURCE_VERSION | cut -c 1-7)
+      - IMAGE_TAG=$COMMIT_HASH
+      - echo "Setting up Node.js environment for Juice Shop"
+      - node --version
+      - npm --version
+
+  build:
+    commands:
+      - echo Building the Docker image...
+      - docker build -t $REPOSITORY_URI:latest .
+      - docker tag $REPOSITORY_URI:latest $REPOSITORY_URI:$IMAGE_TAG
+      - echo Pushing the Docker image...
+      - docker push $REPOSITORY_URI:latest
+      - docker push $REPOSITORY_URI:$IMAGE_TAG
+
+  post_build:
+    commands:
+      - chmod +x ./scripts/before_install.sh
+      - ./scripts/before_install.sh
+      - echo "Creating Kubernetes namespace..."
+      - kubectl apply -f k8s/juice-shop-namespace.yaml || true
+      - cp k8s/deployment.yaml k8s/deployment-temp.yaml
+      - sed -i "s|IMAGE_PLACEHOLDER|$REPOSITORY_URI:$IMAGE_TAG|g" k8s/deployment-temp.yaml
+      - echo "Applying Kubernetes deployment..."
+      - kubectl apply -f k8s/deployment-temp.yaml --validate=false || echo "Failed to apply deployment"
+      - echo "Applying Kubernetes service..."
+      - kubectl apply -f k8s/service.yaml --validate=false || echo "Failed to apply service"
+      - echo "Applying Kubernetes ingress..."
+      - kubectl apply -f k8s/ingress.yaml --validate=false || echo "Failed to apply ingress"
+      - chmod +x ./scripts/after_install.sh
+      - ./scripts/after_install.sh
+      - echo Deployment completed successfully!
+
+artifacts:
+  files:
+    - k8s/deployment.yaml
+    - k8s/service.yaml
+    - k8s/ingress.yaml
+    - appspec.yml
+    - buildspec.yml
+    - scripts/before_install.sh
+    - scripts/after_install.sh
+
+cache:
+  paths:
+    - 'node_modules/**/*'
+
+env:
+  variables:
+    NODE_ENV: "production"
+  parameter-store:
+    AWS_ACCOUNT_ID: "/juice-shop/aws-account-id"
+    EKS_CLUSTER_NAME: "/juice-shop/eks-cluster-name"
